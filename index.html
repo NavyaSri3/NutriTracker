@@ -228,8 +228,10 @@
 
     function getTodayDateString() {
       const now = new Date();
-      const offset = now.getTimezoneOffset() * 60000;
-      return new Date(now - offset).toISOString().split('T')[0];
+      const y = now.getFullYear();
+      const m = String(now.getMonth() + 1).padStart(2, '0');
+      const d = String(now.getDate()).padStart(2, '0');
+      return `${y}-${m}-${d}`;
     }
 
     function formatDisplayDate(dateStr) {
@@ -292,6 +294,19 @@
       return trimmed;
     }
 
+    function mergeDayItems(existingItems, incomingItems) {
+      const merged = [];
+      const seenIds = new Set();
+      [...(Array.isArray(existingItems) ? existingItems : []), ...(Array.isArray(incomingItems) ? incomingItems : [])].forEach((item, idx) => {
+        if (!item || typeof item !== 'object') return;
+        const id = item.id || `legacy_${idx}_${item.name || 'item'}`;
+        if (seenIds.has(id)) return;
+        seenIds.add(id);
+        merged.push({ ...item, id });
+      });
+      return merged;
+    }
+
     function loadState() {
       try {
         const raw = localStorage.getItem(STORAGE_KEY);
@@ -304,11 +319,15 @@
           ...parsed,
           settings: mergedSettings,
           targets: { ...DEFAULT_STATE.targets, ...(parsed.targets || {}) },
-          activeDay: { ...DEFAULT_STATE.activeDay, ...(parsed.activeDay || {}) },
+          activeDay: {
+            ...DEFAULT_STATE.activeDay,
+            ...(parsed.activeDay || {}),
+            items: Array.isArray(parsed.activeDay?.items) ? parsed.activeDay.items : []
+          },
           pendingItems: Array.isArray(parsed.pendingItems) ? parsed.pendingItems : [],
           pendingAssumptions: parsed.pendingAssumptions || '',
-          micronutrients: parsed.micronutrients || DEFAULT_STATE.micronutrients,
-          history: parsed.history || []
+          micronutrients: Array.isArray(parsed.micronutrients) ? parsed.micronutrients : DEFAULT_STATE.micronutrients,
+          history: Array.isArray(parsed.history) ? parsed.history : []
         };
       } catch (e) {
         console.error('Failed to load state:', e);
@@ -322,6 +341,78 @@
       } catch (e) {
         console.error('Failed to save state:', e);
       }
+    }
+
+    function normalizeAndArchiveHistory(todayStr) {
+      const byDate = new Map();
+
+      (Array.isArray(appState.history) ? appState.history : []).forEach(entry => {
+        if (!entry || !entry.date) return;
+        const prev = byDate.get(entry.date);
+        const mergedItems = mergeDayItems(prev?.items, entry.items);
+        if (mergedItems.length === 0) return;
+        byDate.set(entry.date, {
+          date: entry.date,
+          completed: true,
+          items: mergedItems,
+          totals: calculateItemsTotals(mergedItems),
+          targetsSnapshot: entry.targetsSnapshot || prev?.targetsSnapshot || { ...appState.targets }
+        });
+      });
+
+      let restoredTodayItems = [];
+      if (byDate.has(todayStr)) {
+        restoredTodayItems = byDate.get(todayStr).items;
+        byDate.delete(todayStr);
+      }
+
+      appState.history = Array.from(byDate.values()).sort((a, b) => b.date.localeCompare(a.date));
+      return restoredTodayItems;
+    }
+
+    function ensureCurrentDay({ notify = false } = {}) {
+      const today = getTodayDateString();
+      const previousDate = appState.activeDay?.date;
+      const dayChanged = previousDate !== today;
+
+      if (dayChanged) {
+        // Archive previous activeDay into history if it had any logged items
+        if (previousDate && Array.isArray(appState.activeDay?.items) && appState.activeDay.items.length > 0) {
+          appState.history = [
+            ...(Array.isArray(appState.history) ? appState.history : []),
+            {
+              date: previousDate,
+              completed: true,
+              items: appState.activeDay.items,
+              totals: calculateItemsTotals(appState.activeDay.items),
+              targetsSnapshot: { ...appState.targets }
+            }
+          ];
+        }
+
+        const restoredTodayItems = normalizeAndArchiveHistory(today);
+        appState.activeDay = {
+          date: today,
+          completed: false,
+          items: restoredTodayItems,
+          aiInsight: ''
+        };
+
+        saveState();
+        if (notify) {
+          renderAll();
+          showToast(`Updated to ${formatDisplayDate(today)}. Previous log saved to History.`, 'info');
+        }
+        return true;
+      }
+
+      // Even if same day, keep history deduplicated & sorted
+      const restored = normalizeAndArchiveHistory(today);
+      if (restored.length > 0) {
+        appState.activeDay.items = mergeDayItems(appState.activeDay.items, restored);
+        saveState();
+      }
+      return false;
     }
 
     function syncCredentialsFromInputs() {
@@ -359,6 +450,9 @@
 
     function switchTab(tabId) {
       syncCredentialsFromInputs();
+      if (!ensureCurrentDay({ notify: true }) && (tabId === 'history' || tabId === 'table' || tabId === 'log')) {
+        renderAll();
+      }
 
       ['log', 'table', 'history', 'settings'].forEach(v => {
         const el = document.getElementById(`view-${v}`);
@@ -527,6 +621,7 @@
 
     async function handleMealSubmit() {
       syncCredentialsFromInputs();
+      ensureCurrentDay({ notify: true });
 
       const input = document.getElementById('mealPromptInput');
       const text = input.value.trim();
@@ -550,9 +645,11 @@
           throw new Error('Model returned no food items for this prompt.');
         }
 
+        ensureCurrentDay({ notify: true });
         appState.pendingAssumptions = result.assumptions || '';
         appState.pendingItems = result.items.map((item, idx) => ({
           id: 'item_' + Date.now() + '_' + idx,
+          loggedDate: appState.activeDay.date,
           name: item.name || 'Food',
           portion: item.portion || '1 serving',
           calories: Number(item.calories) || 0,
@@ -578,6 +675,8 @@
     }
 
     function handleManualMealSubmit() {
+      ensureCurrentDay({ notify: true });
+
       const nameInput = document.getElementById('manualName');
       const portionInput = document.getElementById('manualPortion');
       const caloriesInput = document.getElementById('manualCalories');
@@ -593,6 +692,7 @@
 
       const manualItem = {
         id: 'item_manual_' + Date.now(),
+        loggedDate: appState.activeDay.date,
         name: nameInput.value.trim() || 'Custom Meal',
         portion: portionInput.value.trim() || '1 serving',
         calories: caloriesVal,
@@ -621,12 +721,20 @@
 
     function confirmPendingItems() {
       if (!appState.pendingItems.length) return;
-      appState.activeDay.items.push(...appState.pendingItems);
+      ensureCurrentDay({ notify: true });
+
+      const today = appState.activeDay.date;
+      const stampedItems = appState.pendingItems.map(item => ({
+        ...item,
+        loggedDate: today
+      }));
+
+      appState.activeDay.items.push(...stampedItems);
       appState.pendingItems = [];
       appState.pendingAssumptions = '';
       saveState();
       renderAll();
-      showToast('Items added to your log!');
+      showToast('Items added to today\'s log!');
     }
 
     function discardPendingItems() {
@@ -637,14 +745,110 @@
     }
 
     function deleteLogItem(id) {
+      ensureCurrentDay({ notify: true });
       appState.activeDay.items = appState.activeDay.items.filter(i => i.id !== id);
       saveState();
       renderAll();
       showToast('Item removed', 'info');
     }
 
+    function renderHistoryView(activeNutrients, todayTotals) {
+      const historyContainer = document.getElementById('historyContainer');
+      if (!historyContainer) return;
+
+      const todayCount = appState.activeDay.items.length;
+      const todayTarget = appState.targets.calories || 2000;
+      const todayKcal = todayTotals.calories || 0;
+
+      let html = `
+        <div class="bg-brand-50/70 dark:bg-brand-950/30 border border-brand-200 dark:border-brand-900/50 rounded-2xl p-3.5 flex items-center justify-between">
+          <div>
+            <div class="text-[10px] font-bold uppercase tracking-wider text-brand-700 dark:text-brand-400">Today • In Progress</div>
+            <div class="font-bold text-xs mt-0.5">${escapeHtml(formatDisplayDate(appState.activeDay.date))}</div>
+            <div class="text-[11px] text-slate-500 dark:text-slate-400">${todayCount} ${todayCount === 1 ? 'item' : 'items'} logged • Auto-archives at midnight</div>
+          </div>
+          <div class="text-right">
+            <div class="font-black text-sm text-brand-600 dark:text-brand-400">${todayKcal} kcal</div>
+            <div class="text-[10px] text-slate-400">/ ${todayTarget} kcal</div>
+          </div>
+        </div>
+      `;
+
+      const pastDays = Array.isArray(appState.history) ? appState.history : [];
+      if (pastDays.length === 0) {
+        html += `
+          <div class="text-xs text-slate-400 p-5 text-center bg-slate-50 dark:bg-slate-900/60 rounded-2xl border border-slate-100 dark:border-slate-700/60">
+            No completed past days yet. Each day's logged meals automatically move here as soon as a new day begins.
+          </div>
+        `;
+        historyContainer.innerHTML = html;
+        return;
+      }
+
+      pastDays.forEach(day => {
+        const items = Array.isArray(day.items) ? day.items : [];
+        const dayTotals = calculateItemsTotals(items);
+        const calTarget = day.targetsSnapshot?.calories || appState.targets.calories || 2000;
+        const calConsumed = dayTotals.calories || 0;
+        const pct = Math.min(100, Math.round((calConsumed / calTarget) * 100));
+
+        const macroBadges = activeNutrients.slice(1).map(n => {
+          const val = dayTotals[n.key] || 0;
+          return `<span class="px-2 py-0.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-200/70 dark:border-slate-700 text-[10px] font-semibold">${escapeHtml(n.short)}: ${val}${n.unit}</span>`;
+        }).join('');
+
+        const itemsListHtml = items.map(item => `
+          <div class="flex justify-between items-center py-1.5 border-t border-slate-200/60 dark:border-slate-700/60 text-xs">
+            <div>
+              <div class="font-semibold">${escapeHtml(item.name)}</div>
+              <div class="text-[11px] text-slate-500">${escapeHtml(item.portion)} • P: ${item.protein_g || 0}g | C: ${item.carbs_g || 0}g | F: ${item.fat_g || 0}g</div>
+            </div>
+            <span class="font-bold text-brand-600 dark:text-brand-400 shrink-0 ml-2">${item.calories || 0} kcal</span>
+          </div>
+        `).join('');
+
+        html += `
+          <div class="bg-slate-50 dark:bg-slate-900/70 rounded-2xl p-4 border border-slate-200/80 dark:border-slate-700/60 space-y-3">
+            <div class="flex justify-between items-start">
+              <div>
+                <div class="font-bold text-sm">${escapeHtml(formatDisplayDate(day.date))}</div>
+                <div class="text-[11px] text-slate-500">${items.length} ${items.length === 1 ? 'item' : 'items'} logged</div>
+              </div>
+              <div class="text-right">
+                <div class="font-black text-sm text-brand-600 dark:text-brand-400">${calConsumed} kcal</div>
+                <div class="text-[10px] text-slate-400">/ ${calTarget} kcal</div>
+              </div>
+            </div>
+
+            <div class="w-full bg-slate-200 dark:bg-slate-700 h-2 rounded-full overflow-hidden">
+              <div class="bg-brand-600 h-full rounded-full" style="width: ${pct}%"></div>
+            </div>
+
+            <div class="flex flex-wrap gap-1.5">${macroBadges}</div>
+
+            <details class="group pt-1">
+              <summary class="cursor-pointer text-xs font-semibold text-brand-600 dark:text-brand-400 select-none">
+                View logged meals (${items.length})
+              </summary>
+              <div class="mt-2 space-y-0.5">
+                ${itemsListHtml}
+              </div>
+            </details>
+          </div>
+        `;
+      });
+
+      historyContainer.innerHTML = html;
+    }
+
     function renderAll() {
-      document.getElementById('headerDateDisplay').textContent = formatDisplayDate(appState.activeDay.date);
+      if (appState.activeDay?.date !== getTodayDateString()) {
+        ensureCurrentDay({ notify: false });
+      }
+
+      document.getElementById('headerDateDisplay').textContent = `Today • ${formatDisplayDate(appState.activeDay.date)}`;
+      const badgeEl = document.getElementById('activeDayBadge');
+      if (badgeEl) badgeEl.textContent = formatDisplayDate(appState.activeDay.date);
 
       // Render Summary
       const totals = calculateItemsTotals(appState.activeDay.items);
@@ -742,6 +946,9 @@
       tableHtml += `</tbody></table>`;
       tableContainer.innerHTML = tableHtml;
 
+      // Render History View
+      renderHistoryView(activeNutrients, totals);
+
       // Render Settings Inputs
       document.getElementById('settingsApiKey').value = appState.settings.apiKey;
       document.getElementById('settingsModel').value = appState.settings.model;
@@ -777,10 +984,30 @@
     }
 
     window.onload = function() {
+      ensureCurrentDay({ notify: false });
       initTheme();
       renderAll();
+
       document.getElementById('settingsApiKey').addEventListener('change', syncCredentialsFromInputs);
       document.getElementById('settingsModel').addEventListener('change', syncCredentialsFromInputs);
+
+      // Automatically detect day changes when returning to the app or crossing midnight
+      window.addEventListener('focus', () => ensureCurrentDay({ notify: true }));
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+          ensureCurrentDay({ notify: true });
+        }
+      });
+      window.addEventListener('storage', (e) => {
+        if (e.key === STORAGE_KEY) {
+          appState = loadState();
+          ensureCurrentDay({ notify: false });
+          renderAll();
+        }
+      });
+      setInterval(() => {
+        ensureCurrentDay({ notify: true });
+      }, 30000);
     };
   </script>
 </body>
